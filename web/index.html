@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LANPush 局域网文件分发</title>
+<style>
+  * { box-sizing: border-box; }
+  :root {
+    --bg: #f4f6f8;
+    --card: #ffffff;
+    --line: #e4e7ec;
+    --text: #101828;
+    --muted: #667085;
+    --accent: #1d6ff2;
+    --accent-soft: #eaf1fe;
+    --ok: #0f9d58;
+    --warn: #d98207;
+    --bad: #d92d20;
+  }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased; overflow-x: hidden;
+  }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+
+  /* ---------- 顶栏 ---------- */
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; row-gap: 8px;
+    padding: 12px 18px; background: #fff; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 20;
+  }
+  .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; font-size: 15px; letter-spacing: .2px; white-space: nowrap; flex: 0 0 auto; }
+  .logo {
+    width: 26px; height: 26px; border-radius: 7px; background: var(--accent); color: #fff;
+    display: grid; place-items: center; font-size: 13px; font-weight: 700; flex: 0 0 auto;
+  }
+  .addr {
+    display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%;
+    background: #f8fafc; border: 1px solid var(--line); border-radius: 8px;
+    padding: 4px 4px 4px 11px; color: var(--muted); font-size: 12.5px; white-space: nowrap;
+  }
+  .addr b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
+  .ghost {
+    border: 1px solid var(--line); background: #fff; border-radius: 6px;
+    padding: 3px 9px; font-size: 12px; color: var(--muted); white-space: nowrap; flex: 0 0 auto;
+  }
+  .ghost:hover { border-color: #c7cdd6; color: var(--text); }
+  .spacer { flex: 1 1 auto; }
+  .online {
+    display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted);
+    white-space: nowrap; flex: 0 0 auto;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #c9cfd8; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(15,157,88,.14); }
+
+  /* ---------- 布局 ---------- */
+  main {
+    display: grid; grid-template-columns: minmax(0, 372px) minmax(0, 1fr);
+    gap: 14px; padding: 14px 18px 28px; align-items: start;
+    max-width: 1680px; margin: 0 auto;
+  }
+  @media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 11px;
+    overflow: hidden;
+  }
+  .card + .card { margin-top: 14px; }
+  .card-h {
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 14px; border-bottom: 1px solid var(--line);
+    font-size: 13px; font-weight: 620;
+  }
+  .card-h .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
+  .card-b { padding: 12px 14px; }
+  .card-h .mini { margin-left: auto; display: flex; gap: 6px; }
+
+  /* ---------- 文件区 ---------- */
+  .drop {
+    border: 1.5px dashed #cfd6e0; border-radius: 9px; padding: 16px 12px;
+    text-align: center; color: var(--muted); font-size: 12.5px; background: #fbfcfe;
+    transition: .15s; cursor: pointer;
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+  .drop strong { display: block; color: var(--text); font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+  .drop.over strong { color: var(--accent); }
+  .filelist { margin-top: 10px; max-height: 236px; overflow: auto; }
+  .fitem {
+    display: flex; align-items: center; gap: 9px; padding: 7px 8px; border-radius: 7px;
+    font-size: 13px; cursor: pointer;
+  }
+  .fitem:hover { background: #f6f8fb; }
+  .fitem input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
+  .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fitem.isdir .fname { font-weight: 600; }
+  .fi { flex: 0 0 auto; display: block; }
+  .fsize { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .empty { color: #98a2b3; font-size: 12.5px; text-align: center; padding: 14px 0; }
+
+  /* ---------- 设置 ---------- */
+  .field { margin-bottom: 11px; }
+  .field:last-child { margin-bottom: 0; }
+  .field label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
+  .field input[type=text] {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+    background: #fff; font-size: 13px; font-variant-numeric: tabular-nums;
+  }
+  .field input[type=text]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(29,111,242,.1); }
+  .field input::placeholder { color: #a7b0bd; }
+  .switches { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 2px; }
+  .sw { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+  .sw input { accent-color: var(--accent); width: 15px; height: 15px; }
+
+  .primary {
+    width: 100%; margin-top: 12px; padding: 10px; border: 0; border-radius: 8px;
+    background: var(--accent); color: #fff; font-size: 14px; font-weight: 620;
+    transition: .15s;
+  }
+  .primary:hover:not(:disabled) { background: #155fd6; }
+  .primary:disabled { background: #cdd6e4; cursor: not-allowed; }
+  .tip { margin-top: 8px; font-size: 12px; color: var(--muted); text-align: center; min-height: 16px; }
+  .tip.bad { color: var(--bad); }
+  .tip.ok { color: var(--ok); }
+
+  /* ---------- 设备 ---------- */
+  .devlist { max-height: 320px; overflow: auto; }
+  .dev {
+    display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 7px;
+    cursor: pointer; font-size: 13px;
+  }
+  .dev:hover { background: #f6f8fb; }
+  .dev input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
+  .dev .nm { font-weight: 550; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dev .meta { margin-left: auto; display: flex; gap: 10px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+  .dev.off { opacity: .5; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 20px; background: #f2f4f7; color: var(--muted); }
+  .tag.on { background: #e8f7ef; color: var(--ok); }
+
+  /* ---------- 进度 ---------- */
+  .task { border-top: 1px solid var(--line); }
+  .task:first-child { border-top: 0; }
+  .task-h {
+    display: flex; align-items: center; gap: 10px; padding: 9px 14px; background: #fbfcfe;
+    font-size: 12.5px; color: var(--muted); flex-wrap: wrap;
+  }
+  .task-h .ttl { font-weight: 600; color: var(--text); font-size: 13px; }
+  .task-h .paths { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46%; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 20px; }
+  .pill.running { background: var(--accent-soft); color: var(--accent); }
+  .pill.done { background: #e8f7ef; color: var(--ok); }
+  .pill.partial { background: #fdf3e3; color: var(--warn); }
+  .pill.failed, .pill.cancelled { background: #fdeceb; color: var(--bad); }
+  .rows { padding: 4px 14px 12px; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 12.5px; }
+  .row .rn { width: 168px; flex: 0 0 168px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar { flex: 1; height: 7px; background: #eef1f5; border-radius: 5px; overflow: hidden; position: relative; }
+  .bar > i { display: block; height: 100%; width: 0%; background: var(--accent); border-radius: 5px; transition: width .45s ease; }
+  .bar.ok > i { background: var(--ok); }
+  .bar.bad > i { background: var(--bad); }
+  .row .rs { width: 128px; flex: 0 0 128px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .row .rs.err { color: var(--bad); }
+  .row .rs.ok { color: var(--ok); }
+  .up { font-size: 12px; color: var(--muted); padding: 6px 0 0; }
+  .spin { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity: .25 } 50% { opacity: 1 } }
+  .footer { text-align: center; color: #98a2b3; font-size: 11.5px; padding: 4px 0 0; }
+
+  @media (max-width: 760px) {
+    .row .rn { width: auto; flex: 1 1 auto; }
+    .row .rs { width: 96px; flex: 0 0 96px; }
+    .task-h .paths { max-width: 100%; flex: 1 1 100%; }
+    .dev .meta { display: none; }
+    main { padding: 12px 12px 24px; }
+    header { padding: 10px 12px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">LP</span>局域网文件分发</div>
+  <div class="addr" title="被控端填这个地址（一般在同一局域网内会自动发现，无需填写）">
+    服务地址 <b id="url">-</b>
+    <button class="ghost" onclick="copyUrl()">复制</button>
+  </div>
+  <div class="spacer"></div>
+  <div class="online"><span class="dot" id="dot"></span><span id="onlineTxt">在线 -/-</span></div>
+  <button class="ghost" onclick="shutdownHost()">退出</button>
+</header>
+
+<main>
+  <div>
+    <!-- 文件 -->
+    <section class="card">
+      <div class="card-h">
+        1. 选择文件
+        <span class="hint" id="repoHint">仓库</span>
+        <div class="mini">
+          <button class="ghost" onclick="openRepo()">打开文件夹</button>
+          <button class="ghost" onclick="refreshRepo()">刷新</button>
+        </div>
+      </div>
+      <div class="card-b">
+        <div class="drop" id="drop">
+          <strong>把文件拖到这里</strong>
+          或点击选择（可多选，大文件直接传）<br>
+          <span style="font-size:11.5px">整个文件夹请点「打开文件夹」复制进去</span>
+          <input type="file" id="picker" multiple style="display:none">
+        </div>
+        <div class="up" id="upBox" style="display:none">
+          <div id="upTxt">上传中…</div>
+        </div>
+        <div class="filelist" id="files"></div>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="card">
+      <div class="card-h">2. 分发设置</div>
+      <div class="card-b">
+        <div class="field">
+          <label>被控端保存目录</label>
+          <input type="text" id="dir" placeholder="留空 = 用每台电脑自己的接收目录">
+        </div>
+        <div class="switches">
+          <label class="sw"><input type="checkbox" id="overwrite"> 同名覆盖</label>
+          <label class="sw"><input type="checkbox" id="skipExisting"> 已存在则跳过</label>
+        </div>
+        <button class="primary" id="go" onclick="distribute()">开始分发</button>
+        <div class="tip" id="tip"></div>
+      </div>
+    </section>
+  </div>
+
+  <div>
+    <!-- 设备 -->
+    <section class="card">
+      <div class="card-h">
+        3. 选择接收设备
+        <span class="hint" id="devHint"></span>
+        <div class="mini">
+          <button class="ghost" onclick="pickAll(true)">全选</button>
+          <button class="ghost" onclick="pickAll(false)">清空</button>
+          <button class="ghost" onclick="pickOnline()">仅在线</button>
+        </div>
+      </div>
+      <div class="card-b" style="padding:4px 8px">
+        <div class="devlist" id="devs"></div>
+      </div>
+    </section>
+
+    <!-- 进度 -->
+    <section class="card">
+      <div class="card-h">4. 分发进度<span class="hint">每个设备独立进度，断点自动续传</span></div>
+      <div id="tasks"></div>
+    </section>
+    <div class="footer" id="footer"></div>
+  </div>
+</main>
+
+<script>
+var state = { agents: [], repo: [], tasks: [], host: {} };
+var selDev = new Set();     // 选中的设备 id
+var selFile = new Set();    // 选中的文件名
+var knownDev = new Set();
+var lastTaskSig = "";
+var busy = false;
+
+function el(id) { return document.getElementById(id); }
+function fmt(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  var u = ["KB", "MB", "GB", "TB"], i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return (n >= 100 ? n.toFixed(0) : n.toFixed(1)) + " " + u[i];
+}
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+
+/* ---------------- 轮询状态 ---------------- */
+function poll() {
+  fetch("/api/state", { cache: "no-store" })
+    .then(function (r) { return r.json(); })
+    .then(function (s) {
+      state = s;
+      el("url").textContent = s.host.url || "-";
+      el("footer").textContent = "主控端 " + (s.host.hostname || "") + " · 仓库 " + (s.host.repo || "") + " · v" + s.version;
+      var on = s.agents.filter(function (a) { return a.online; }).length;
+      el("onlineTxt").textContent = "在线 " + on + "/" + s.agents.length;
+      el("dot").className = "dot" + (on ? " on" : "");
+      renderDevices();
+      renderFiles();
+      renderTasks();
+      if (!el("dir").dataset.touched && s.defaultDir) el("dir").value = s.defaultDir;
+    })
+    .catch(function () {
+      el("dot").className = "dot";
+      el("onlineTxt").textContent = "连接已断开";
+    });
+}
+
+/* ---------------- 设备 ---------------- */
+var devSig = "";
+function renderDevices() {
+  var box = el("devs");
+  if (!state.agents.length) {
+    if (devSig !== "empty") {
+      devSig = "empty";
+      box.innerHTML = '<div class="empty">还没有被控端在线。<br>把“被控端”程序装到 20 台电脑上运行即可自动出现。</div>';
+    }
+    el("devHint").textContent = "";
+    return;
+  }
+  var sig = state.agents.map(function (a) { return a.id + a.online + a.name + a.freeText; }).join("|");
+  if (sig !== devSig) {
+    devSig = sig;
+    var html = "";
+    state.agents.forEach(function (a) {
+      var chk = selDev.has(a.id) ? " checked" : "";
+      html += '<label class="dev' + (a.online ? "" : " off") + '">' +
+        '<input type="checkbox"' + chk + ' data-aid="' + esc(a.id) + '">' +
+        '<span class="nm" title="' + esc(a.name) + '">' + esc(a.name) + '</span>' +
+        '<span class="tag ' + (a.online ? "on" : "") + '">' + (a.online ? "在线" : "离线") + '</span>' +
+        '<span class="meta"><span>' + esc(a.ip || "-") + '</span><span>' + (a.free ? a.freeText : "") + '</span></span>' +
+        '</label>';
+    });
+    box.innerHTML = html;
+    Array.prototype.forEach.call(box.querySelectorAll("input[data-aid]"), function (inp) {
+      inp.addEventListener("change", function () {
+        if (inp.checked) selDev.add(inp.dataset.aid); else selDev.delete(inp.dataset.aid);
+        el("devHint").textContent = "已选 " + selDev.size + " 台";
+      });
+    });
+  }
+  el("devHint").textContent = "已选 " + selDev.size + " 台";
+  Array.prototype.forEach.call(box.querySelectorAll("input[data-aid]"), function (inp) {
+    inp.checked = selDev.has(inp.dataset.aid);
+  });
+}
+function pickAll(v) {
+  selDev.clear();
+  state.agents.forEach(function (a) { if (v) selDev.add(a.id); });
+  renderDevices();
+}
+function pickOnline() {
+  selDev.clear();
+  state.agents.forEach(function (a) { if (a.online) selDev.add(a.id); });
+  renderDevices();
+}
+
+/* ---------------- 文件 ---------------- */
+var fileSig = "";
+function renderFiles() {
+  var box = el("files");
+  el("repoHint").textContent = "仓库 " + state.repo.length + " 项";
+  var sig = state.repo.map(function (f) { return f.name + f.size; }).join("|");
+  if (sig !== fileSig) {
+    fileSig = sig;
+    if (!state.repo.length) {
+      box.innerHTML = '<div class="empty">仓库是空的，拖文件进来或点“打开文件夹”复制进去</div>';
+    } else {
+      var html = "";
+      state.repo.forEach(function (f) {
+        var icon = f.isDir
+          ? '<svg class="fi" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M1.6 3.4h4.2l1.5 1.9h7.1v7.9H1.6z" fill="#fdf3e3" stroke="#d98207" stroke-width="1.2" stroke-linejoin="round"/></svg>'
+          : '<svg class="fi" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M3.4 1.6h6l3.8 3.8v9H3.4z" fill="#f4f6f8" stroke="#b6bec9" stroke-width="1.1" stroke-linejoin="round"/></svg>';
+        var meta = f.isDir ? (fmt(f.size) + " · " + (f.count || 0) + " 个文件") : fmt(f.size);
+        html += '<label class="fitem' + (f.isDir ? " isdir" : "") + '"><input type="checkbox" data-name="' + esc(f.name) + '">' +
+          icon +
+          '<span class="fname" title="' + esc(f.name) + '">' + esc(f.name) + '</span>' +
+          '<span class="fsize">' + meta + '</span></label>';
+      });
+      box.innerHTML = html;
+      Array.prototype.forEach.call(box.querySelectorAll("input[data-name]"), function (inp) {
+        inp.addEventListener("change", function () {
+          if (inp.checked) selFile.add(inp.dataset.name); else selFile.delete(inp.dataset.name);
+        });
+      });
+    }
+  }
+  Array.prototype.forEach.call(box.querySelectorAll("input[data-name]"), function (inp) {
+    inp.checked = selFile.has(inp.dataset.name);
+  });
+}
+
+/* ---------------- 上传 ---------------- */
+var drop = el("drop"), picker = el("picker");
+drop.onclick = function () { picker.click(); };
+picker.onchange = function () { if (picker.files.length) uploadAll(picker.files); picker.value = ""; };
+["dragenter", "dragover"].forEach(function (e) {
+  drop.addEventListener(e, function (ev) { ev.preventDefault(); drop.classList.add("over"); });
+});
+["dragleave", "drop"].forEach(function (e) {
+  drop.addEventListener(e, function (ev) { ev.preventDefault(); drop.classList.remove("over"); });
+});
+drop.addEventListener("drop", function (ev) {
+  var items = ev.dataTransfer.items;
+  if (items && items.length) {
+    for (var i = 0; i < items.length; i++) {
+      var e = items[i].webkitGetAsEntry && items[i].webkitGetAsEntry();
+      if (e && e.isDirectory) {
+        tip("文件夹别拖网页：点「打开文件夹」把整个文件夹复制到待分发目录，再在这里勾选即可", "bad");
+        return;
+      }
+    }
+  }
+  if (ev.dataTransfer.files.length) uploadAll(ev.dataTransfer.files);
+});
+
+function uploadAll(fileList) {
+  var arr = Array.prototype.slice.call(fileList), i = 0;
+  el("upBox").style.display = "block";
+  (function next() {
+    if (i >= arr.length) {
+      el("upBox").style.display = "none";
+      refreshRepo();
+      return;
+    }
+    var f = arr[i++];
+    el("upTxt").textContent = "上传 " + f.name + "（" + (i) + "/" + arr.length + "）…";
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload?name=" + encodeURIComponent(f.name));
+    xhr.upload.onprogress = function (e) {
+      if (e.lengthComputable) el("upTxt").textContent = "上传 " + f.name + " " + Math.floor(e.loaded / e.total * 100) + "%";
+    };
+    xhr.onload = function () {
+      if (xhr.status === 200) {
+        try { JSON.parse(xhr.responseText).repo.forEach(function (r) { if (r.name === f.name) selFile.add(r.name); }); } catch (e) {}
+      }
+      next();
+    };
+    xhr.onerror = function () { next(); };
+    xhr.send(f);
+  })();
+}
+
+function refreshRepo() {
+  fetch("/api/refresh", { method: "POST" }).then(function (r) { return r.json(); })
+    .then(function (d) { if (d.repo) { state.repo = d.repo; renderFiles(); } });
+}
+function openRepo() { fetch("/api/open_repo", { method: "POST" }); }
+el("dir").addEventListener("input", function () { el("dir").dataset.touched = "1"; });
+
+/* ---------------- 分发 ---------------- */
+function tip(msg, kind) {
+  var t = el("tip");
+  t.textContent = msg || "";
+  t.className = "tip" + (kind ? " " + kind : "");
+}
+function distribute() {
+  if (busy) return;
+  var agents = Array.from(selDev), files = Array.from(selFile);
+  if (!agents.length) return tip("请先勾选接收设备", "bad");
+  if (!files.length) return tip("请先选择要分发的文件", "bad");
+  var off = state.agents.filter(function (a) { return selDev.has(a.id) && !a.online; }).length;
+  busy = true; el("go").disabled = true; tip("正在创建任务…");
+  fetch("/api/distribute", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      agents: agents, files: files,
+      dir: el("dir").value.trim(),
+      overwrite: el("overwrite").checked,
+      skipExisting: el("skipExisting").checked
+    })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    busy = false; el("go").disabled = false;
+    if (d.error) return tip(d.error, "bad");
+    tip("已下发到 " + agents.length + " 台设备" + (off ? "（其中 " + off + " 台离线，上线后自动补传）" : ""), "ok");
+    poll();
+  }).catch(function () {
+    busy = false; el("go").disabled = false;
+    tip("分发请求失败，请检查主控端是否在运行", "bad");
+  });
+}
+
+/* ---------------- 进度 ---------------- */
+function statusText(st) {
+  return { pending: "等待对方连接", running: "传输中", done: "已完成", error: "失败" }[st] || st || "等待中";
+}
+function renderTasks() {
+  var box = el("tasks");
+  var sig = state.tasks.map(function (t) {
+    return t.id + ":" + Object.keys(t.agents || {}).join(",") + ":" + t.status;
+  }).join("|");
+  if (!state.tasks.length) {
+    box.innerHTML = '<div class="empty" style="padding:22px 0">还没有分发任务</div>';
+    lastTaskSig = "";
+    return;
+  }
+  if (sig !== lastTaskSig) {
+    lastTaskSig = sig;
+    var html = "";
+    state.tasks.forEach(function (t) {
+      var labels = t.labels || (t.files || []).map(function (f) { return f.rel || f.name; });
+      var fnames = labels.length > 3
+        ? labels.slice(0, 2).join("、") + " 等 " + labels.length + " 项"
+        : labels.join("、");
+      html += '<div class="task" data-tid="' + esc(t.id) + '">' +
+        '<div class="task-h">' +
+        '<span class="ttl">' + esc(t.createdText || "") + '</span>' +
+        '<span class="pill ' + t.status + '">' + statusText(t.status === "running" ? "running" : t.status) + '</span>' +
+        '<span class="paths" title="' + esc(fnames) + '">' + esc(fnames) + ' → ' + esc(t.dir || "被控端默认目录") + '</span>' +
+        '<span style="margin-left:auto" class="tmeta">' + fmt(t.total) + ' · ' + (t.files || []).length + ' 个文件</span>' +
+        '</div><div class="rows">';
+      Object.keys(t.agents || {}).forEach(function (aid) {
+        var st = t.agents[aid];
+        html += '<div class="row" data-aid="' + esc(aid) + '">' +
+          '<span class="rn" title="' + esc(st.name || aid) + '">' + esc(st.name || aid) + '</span>' +
+          '<span class="bar"><i></i></span>' +
+          '<span class="rs"></span></div>';
+      });
+      html += "</div></div>";
+    });
+    box.innerHTML = html;
+  }
+  // 增量更新
+  state.tasks.forEach(function (t) {
+    var node = box.querySelector('[data-tid="' + t.id.replace(/"/g, '\\"') + '"]');
+    if (!node) return;
+    Object.keys(t.agents || {}).forEach(function (aid) {
+      var st = t.agents[aid];
+      var row = node.querySelector('[data-aid="' + aid.replace(/"/g, '\\"') + '"]');
+      if (!row) return;
+      var bar = row.querySelector(".bar"), fill = bar.querySelector("i"), rs = row.querySelector(".rs");
+      var pct = st.status === "done" ? 100 : (t.total ? Math.min(99.5, (st.done || 0) / t.total * 100) : 0);
+      fill.style.width = pct.toFixed(1) + "%";
+      bar.className = "bar" + (st.status === "done" ? " ok" : (st.status === "error" ? " bad" : ""));
+      if (st.status === "done") { rs.className = "rs ok"; rs.textContent = "已完成"; }
+      else if (st.status === "error") { rs.className = "rs err"; rs.textContent = st.msg || "失败"; }
+      else if (st.status === "running") { rs.className = "rs"; rs.textContent = fmt(st.done) + " / " + fmt(t.total); }
+      else { rs.className = "rs"; rs.textContent = "等待对方连接"; }
+    });
+    var pill = node.querySelector(".pill");
+    if (pill) {
+      pill.className = "pill " + t.status;
+      pill.textContent = { running: "传输中", done: "全部完成", partial: "部分失败", failed: "失败", cancelled: "已取消" }[t.status] || t.status;
+    }
+  });
+}
+
+/* ---------------- 其他 ---------------- */
+function copyUrl() {
+  var u = el("url").textContent;
+  if (navigator.clipboard) navigator.clipboard.writeText(u);
+  else { var i = document.createElement("input"); i.value = u; document.body.appendChild(i); i.select(); document.execCommand("copy"); i.remove(); }
+}
+function shutdownHost() {
+  if (!confirm("退出后网页将无法访问，20 台被控端会断开。确认退出？")) return;
+  fetch("/api/shutdown", { method: "POST" }).then(function () { document.body.innerHTML = '<div style="padding:60px;text-align:center;color:#667085">主控端已退出，可以关闭此页面。</div>'; });
+}
+
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>
