@@ -9,7 +9,9 @@ import hashlib
 import json
 import os
 import random
+import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -19,12 +21,18 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-VERSION = "1.0.0"
+from tray import tray_available, run_tray, IDI_APPLICATION, IDI_WARNING
+
+VERSION = "1.0.1"
 APP_NAME = "LANPush 被控端"
-DISCOVERY_PORT = 8099
+DISCOVERY_PORT = 8099        # 主控 -> 被控，广播
+DISCOVERY_REPLY_PORT = 8098  # 被控 -> 主控，主动询问
 CHUNK = 1024 * 1024
 IDLE_INTERVAL = 2.0
 MAX_RETRY = 5
+
+# 托盘相关状态，供菜单展示
+STATUS = {"base": "", "last_ok": 0.0, "device": "", "running": True}
 
 
 # ---------------------------------------------------------------- 基础
@@ -142,21 +150,83 @@ def post_json(url: str, obj: dict, timeout: float = 15.0) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
-def discover(timeout: float = 8.0):
-    """监听主控端广播，返回服务地址"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def _local_broadcasts():
+    """本机各网卡的广播地址（多网卡时每个网段都试着喊一声）"""
+    ips = {"255.255.255.255"}
     try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("", DISCOVERY_PORT))
-    except Exception as e:
-        log("监听发现端口失败：%s" % e)
+        info = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        for item in info:
+            ip = item[4][0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+    out = set()
+    for ip in ips:
+        if ip == "255.255.255.255":
+            out.add(ip)
+            continue
+        parts = ip.split(".")
+        if len(parts) == 4:
+            out.add(".".join(parts[:3]) + ".255")
+    return sorted(out | {"255.255.255.255"})
+
+
+def _parse_server(info, addr):
+    """用数据来源 IP 构造地址 —— 不信任包里自报的 url（多网卡/虚拟网卡会错）"""
+    port = int(info.get("port") or 0)
+    if not port:
+        m = re.search(r":(\d+)(?:/|$)", str(info.get("url") or ""))
+        port = int(m.group(1)) if m else 8080
+    ip = addr[0] if addr and addr[0] else ""
+    if not ip or ip.startswith("0."):
         return None
-    s.settimeout(1.0)
+    return "http://%s:%d" % (ip, port)
+
+
+def discover(timeout: float = 8.0):
+    """
+    双通道发现：
+    1) 监听主控端在 8099 的广播
+    2) 主动向各网段 8098 发 hello，主控端单播回复（绕开无法收广播的环境）
+    两种方式都只用「数据来源 IP」构造地址，避免主控端多网卡时自报错误 IP。
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("", DISCOVERY_PORT))
+        listener.settimeout(0.6)
+    except Exception as e:
+        log("监听发现端口 %d 失败：%s" % (DISCOVERY_PORT, e))
+        # 即便绑定失败，仍可用主动询问通道
+        listener = None
     log("正在局域网内寻找主控端…")
+
+    hello = json.dumps({"service": "lanpush", "hello": 1, "name": socket.gethostname()}).encode("utf-8")
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except Exception:
+        pass
+
     end = time.time() + timeout
-    while time.time() < end:
+    last_hello = 0.0
+    found = None
+    while time.time() < end and not found:
+        # 每 2 秒主动喊一次
+        if time.time() - last_hello >= 2.0:
+            for b in _local_broadcasts():
+                try:
+                    sender.sendto(hello, (b, DISCOVERY_REPLY_PORT))
+                except Exception:
+                    pass
+            last_hello = time.time()
+
+        if listener is None:
+            time.sleep(0.4)
+            continue
         try:
-            data, _addr = s.recvfrom(4096)
+            data, addr = listener.recvfrom(4096)
         except socket.timeout:
             continue
         except Exception:
@@ -165,13 +235,23 @@ def discover(timeout: float = 8.0):
             info = json.loads(data.decode("utf-8"))
         except Exception:
             continue
-        if info.get("service") == "lanpush" and info.get("url"):
-            s.close()
-            log("找到主控端：%s（%s）" % (info.get("url"), info.get("name", "")))
-            return info["url"]
-    s.close()
-    log("没有找到主控端广播")
-    return None
+        if info.get("service") != "lanpush":
+            continue
+        server = _parse_server(info, addr)
+        if server:
+            found = server
+            log("找到主控端：%s（%s）" % (found, info.get("name", "")))
+            break
+
+    try:
+        sender.close()
+    except Exception:
+        pass
+    if listener is not None:
+        listener.close()
+    if not found:
+        log("没有找到主控端广播（已尝试广播监听 + 主动询问）")
+    return found
 
 
 # ---------------------------------------------------------------- 进度回报
@@ -430,13 +510,14 @@ def main():
     save_config(cfg)
 
     aid = cfg["id"]
+    STATUS["device"] = cfg["name"]
     log("%s %s 启动，机器名 %s" % (APP_NAME, VERSION, cfg["name"]))
     log("接收目录：%s" % cfg["saveDir"])
 
     base = cfg.get("server") or ""
     fail_streak = 0
 
-    while True:
+    while STATUS["running"]:
         if not base or fail_streak >= 3:
             found = discover(8)
             if found:
@@ -446,7 +527,10 @@ def main():
                 fail_streak = 0
             elif not base:
                 log("仍未找到主控端，10 秒后重试。也可以确认主控端是否已启动。")
-                time.sleep(10)
+                for _ in range(10):
+                    if not STATUS["running"]:
+                        return
+                    time.sleep(1)
                 continue
 
         try:
@@ -465,22 +549,34 @@ def main():
             server_url = resp.get("server") or base
             if server_url and server_url != base:
                 base = server_url
+                cfg["server"] = base
+                save_config(cfg)
             fail_streak = 0
+            STATUS["base"] = base
+            STATUS["last_ok"] = time.time()
             tasks = resp.get("tasks") or []
         except Exception as e:
             fail_streak += 1
             log("连接主控端失败（第 %d 次）：%s" % (fail_streak, e))
             if fail_streak >= 3:
                 log("尝试重新发现主控端…")
-            time.sleep(min(2 * fail_streak, 8))
+            for _ in range(min(2 * fail_streak, 8)):
+                if not STATUS["running"]:
+                    return
+                time.sleep(1)
             continue
 
         if not tasks:
-            time.sleep(IDLE_INTERVAL)
+            for _ in range(int(IDLE_INTERVAL)):
+                if not STATUS["running"]:
+                    return
+                time.sleep(1)
             continue
 
         base = server_url or base
         for t in tasks:
+            if not STATUS["running"]:
+                return
             try:
                 run_task(base, aid, t, cfg)
             except Exception as e:
@@ -488,8 +584,64 @@ def main():
         time.sleep(0.5)
 
 
+def _status_line():
+    if STATUS["last_ok"] and time.time() - STATUS["last_ok"] < 20:
+        return "已连接主控：%s" % STATUS["base"]
+    return "未连接主控，正在寻找…"
+
+
+def _tray_main():
+    def show_log():
+        try:
+            os.startfile(str(LOG_PATH))
+        except Exception:
+            try:
+                subprocess.Popen(["notepad", str(LOG_PATH)])
+            except Exception:
+                pass
+
+    def rediscover():
+        # 清掉旧地址，下轮主循环会重新发现
+        try:
+            cfg = load_config()
+            cfg["server"] = ""
+            save_config(cfg)
+        except Exception:
+            pass
+        log("手动触发重新发现主控端")
+
+    def do_exit():
+        STATUS["running"] = False
+        log("用户从托盘退出")
+        # 不能等主循环优雅退出（可能在长 sleep），直接结束
+        os._exit(0)
+
+    items = [
+        (1001, "查看状态", lambda: msgbox(_status_line(), APP_NAME)),
+        (1002, "重新寻找主控端", rediscover),
+        (1003, "查看运行日志", show_log),
+        (1004, None, None),
+        (1005, "退出被控端", do_exit),
+    ]
+    run_tray(
+        "LANPush 被控端", items,
+        on_double_click=show_log, icon_id=IDI_APPLICATION,
+    )
+
+
+def msgbox(text, title="LANPush"):
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, str(text), str(title), 0x40)
+    except Exception:
+        log(str(text))
+
+
 if __name__ == "__main__":
-    while True:
+    if tray_available():
+        threading.Thread(target=_tray_main, daemon=False).start()
+    while STATUS["running"]:
         try:
             main()
             break
@@ -498,4 +650,7 @@ if __name__ == "__main__":
             break
         except Exception as e:
             log("运行异常，5 秒后自动重启：%s" % e)
-            time.sleep(5)
+            for _ in range(5):
+                if not STATUS["running"]:
+                    break
+                time.sleep(1)

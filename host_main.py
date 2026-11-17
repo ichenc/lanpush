@@ -18,11 +18,17 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.0.0"
+from tray import tray_available, run_tray, IDI_INFORMATION, IDI_WARNING
+
+VERSION = "1.0.1"
 APP_NAME = "LANPush"
-DISCOVERY_PORT = 8099
+DISCOVERY_PORT = 8099      # 主控 -> 被控，广播
+DISCOVERY_REPLY_PORT = 8098  # 被控 -> 主控，主动询问
 CHUNK = 1024 * 1024
 AGENT_ONLINE_SECONDS = 15
+
+# 实际监听端口（可能被顺延），广播和接口一律用它
+ACTIVE_PORT = 8080
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -73,6 +79,7 @@ def msgbox(text: str, title: str = APP_NAME):
 
 
 def lan_ip() -> str:
+    """默认路由网段的本机 IP（用于页面显示）"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -82,6 +89,117 @@ def lan_ip() -> str:
     finally:
         try:
             s.close()
+        except Exception:
+            pass
+
+
+def ip_to(target: str) -> str:
+    """到指定目标时本机使用的源 IP —— 比 lan_ip 更可靠（多网卡/虚拟网卡场景）"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((target, 9))
+        return s.getsockname()[0]
+    except Exception:
+        return lan_ip()
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def local_broadcasts():
+    """本机所有网卡的广播地址，确保多网卡时每个网段都发到"""
+    ips = {"255.255.255.255"}
+    targets = {"8.8.8.8", "10.255.255.255"}
+    for t in list(targets):
+        ips.add(ip_to(t))
+    try:
+        info = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        for item in info:
+            ip = item[4][0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+    out = set()
+    for ip in ips:
+        if ip == "255.255.255.255":
+            out.add(ip)
+            continue
+        parts = ip.split(".")
+        if len(parts) == 4:
+            out.add(".".join(parts[:3]) + ".255")
+    return sorted(out)
+
+
+def discovery_payload():
+    ip = lan_ip()
+    return json.dumps(
+        {
+            "service": "lanpush",
+            "name": socket.gethostname(),
+            "url": "http://%s:%d" % (ip, ACTIVE_PORT),
+            "port": ACTIVE_PORT,
+            "ver": VERSION,
+        }
+    ).encode("utf-8")
+
+
+def discovery_loop():
+    """主控 -> 被控：UDP 广播，每 3 秒一次"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except Exception:
+        pass
+    targets = [(b, DISCOVERY_PORT) for b in local_broadcasts()]
+    payload = discovery_payload()
+    while True:
+        for tgt in targets:
+            try:
+                sock.sendto(payload, tgt)
+            except Exception:
+                pass
+        time.sleep(3)
+
+
+def discovery_reply_loop():
+    """被控 -> 主控：主动询问时单播回复，绕开被控端无法接收广播的环境"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except Exception:
+        pass
+    try:
+        sock.bind(("0.0.0.0", DISCOVERY_REPLY_PORT))
+    except Exception:
+        return
+    while True:
+        try:
+            data, addr = sock.recvfrom(2048)
+        except Exception:
+            time.sleep(1)
+            continue
+        try:
+            info = json.loads(data.decode("utf-8"))
+        except Exception:
+            continue
+        if info.get("service") != "lanpush" or not info.get("hello"):
+            continue
+        # 关键：用「到该被控端的源 IP」回复，避免多网卡时给错地址
+        src = ip_to(addr[0])
+        reply = json.dumps(
+            {
+                "service": "lanpush",
+                "name": socket.gethostname(),
+                "url": "http://%s:%d" % (src, ACTIVE_PORT),
+                "port": ACTIVE_PORT,
+                "ver": VERSION,
+            }
+        ).encode("utf-8")
+        try:
+            sock.sendto(reply, addr)
         except Exception:
             pass
 
@@ -226,34 +344,6 @@ def task_recalc(t: dict):
         t["status"] = "running"
 
 
-# ---------------------------------------------------------------- 广播发现
-def discovery_loop(port: int):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    except Exception:
-        pass
-    targets = {("255.255.255.255", DISCOVERY_PORT)}
-    ip = lan_ip()
-    if ip.count(".") == 3:
-        targets.add((".".join(ip.split(".")[:3]) + ".255", DISCOVERY_PORT))
-    while True:
-        payload = json.dumps(
-            {
-                "service": "lanpush",
-                "name": socket.gethostname(),
-                "url": "http://%s:%d" % (ip, port),
-                "ver": VERSION,
-            }
-        ).encode("utf-8")
-        for tgt in targets:
-            try:
-                sock.sendto(payload, tgt)
-            except Exception:
-                pass
-        time.sleep(3)
-
-
 # ---------------------------------------------------------------- HTTP
 class Handler(BaseHTTPRequestHandler):
     server_version = "LANPush/" + VERSION
@@ -396,7 +486,7 @@ class Handler(BaseHTTPRequestHandler):
                         ],
                     }
                 )
-        self._json({"ok": True, "tasks": pending, "server": "http://%s:%d" % (lan_ip(), CFG["port"])})
+        self._json({"ok": True, "tasks": pending, "server": "http://%s:%d" % (ip_to(self.client_address[0]), ACTIVE_PORT)})
 
     def progress(self):
         d = self._body()
@@ -607,8 +697,8 @@ def state_payload() -> dict:
         "version": VERSION,
         "host": {
             "ip": ip,
-            "port": CFG["port"],
-            "url": "http://%s:%d" % (ip, CFG["port"]),
+            "port": ACTIVE_PORT,
+            "url": "http://%s:%d" % (ip, ACTIVE_PORT),
             "repo": str(REPO),
             "hostname": socket.gethostname(),
         },
@@ -632,6 +722,7 @@ def html_page() -> str:
 
 
 def main():
+    global ACTIVE_PORT
     load_tasks()
     port = int(CFG.get("port") or 8080)
     for attempt in range(12):
@@ -643,8 +734,10 @@ def main():
     else:
         msgbox("没有可用端口（8080-8091 都被占用），程序退出。")
         return
+    ACTIVE_PORT = port
     httpd.daemon_threads = True
-    threading.Thread(target=discovery_loop, args=(port,), daemon=True).start()
+    threading.Thread(target=discovery_loop, daemon=True).start()
+    threading.Thread(target=discovery_reply_loop, daemon=True).start()
     url = "http://127.0.0.1:%d" % port
     if CFG.get("autoOpenBrowser", True):
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
@@ -652,10 +745,44 @@ def main():
     print("本机访问：%s" % url)
     print("局域网访问：http://%s:%d" % (lan_ip(), port))
     print("文件仓库：%s" % REPO)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+
+    def open_console():
+        webbrowser.open(url)
+
+    def open_repo():
+        try:
+            subprocess.Popen(["explorer", str(REPO)])
+        except Exception:
+            pass
+
+    def do_exit():
+        try:
+            httpd.shutdown()
+        except Exception:
+            pass
+        os._exit(0)
+
+    items = [
+        (1001, "打开控制台", open_console),
+        (1002, "打开文件仓库", open_repo),
+        (1003, None, None),
+        (1004, "退出主控端", do_exit),
+    ]
+
+    # 托盘消息循环必须在主线程；服务放后台线程
+    if tray_available():
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        run_tray(
+            "LANPush 主控端", items,
+            on_double_click=open_console, icon_id=IDI_INFORMATION,
+            tip="已启动：http://%s:%d" % (lan_ip(), port),
+        )
+        do_exit()
+    else:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":

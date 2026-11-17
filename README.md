@@ -7,7 +7,8 @@
 ## 特性
 
 - **一对多群发**：勾选多台设备一次下发，每台独立进度条
-- **零配置被控端**：UDP 广播自动发现主控端，登录后自动后台运行
+- **零配置被控端**：双向自动发现（收主控广播 + 主动询问），不依赖主控自报 IP，多网卡/VPN 环境也稳；托盘可一键重新发现
+- **系统托盘**：两端常驻任务栏托盘，右键打开控制台 / 重新发现 / 查看日志 / 退出，双击快捷操作
 - **断点续传**：1MB 分块 + HTTP Range，断网 / 重启后从断点继续
 - **文件夹整包分发**：保留子目录结构，空目录忽略
 - **落盘可靠**：临时文件 + mtime 校验，传完校验大小，不会留下半个坏文件
@@ -34,6 +35,7 @@ bin/                     免安装 exe 与被控端安装脚本（直接用这�
   查看日志.bat
 host_main.py             主控端源码（Python 3）
 agent_main.py            被控端源码（Python 3）
+tray.py                  系统托盘模块（纯 ctypes，无第三方依赖）
 web/index.html           网页控制台源码
 使用说明.md              完整部署与常见问题
 ```
@@ -50,8 +52,8 @@ python host_main.py
 python agent_main.py --server http://主控端IP:8080 --dir D:\LAN接收
 
 :: 打包成 exe（需 pip install pyinstaller）
-pyinstaller --onefile --noconsole --name LANPush-Host --add-data "web;web" host_main.py
-pyinstaller --onefile --noconsole --name LANPush-Agent agent_main.py
+pyinstaller --onefile --noconsole --name LANPush-Host --add-data "web;web" --hidden-import tray host_main.py
+pyinstaller --onefile --noconsole --name LANPush-Agent --hidden-import tray agent_main.py
 ```
 
 打包时若 `--add-data` 用相对路径报错，把 `web` 换成其绝对路径即可。
