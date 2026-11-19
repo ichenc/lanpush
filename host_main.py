@@ -20,7 +20,7 @@ from pathlib import Path
 
 from tray import tray_available, run_tray, IDI_INFORMATION, IDI_WARNING
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 APP_NAME = "LANPush"
 DISCOVERY_PORT = 8099      # 主控 -> 被控，广播
 DISCOVERY_REPLY_PORT = 8098  # 被控 -> 主控，主动询问
@@ -42,7 +42,8 @@ BASE = base_dir()
 DATA = BASE / "data"
 DATA.mkdir(exist_ok=True)
 CONFIG_PATH = DATA / "host_config.json"
-TASKS_PATH = DATA / "tasks.json"
+HISTORY_PATH = DATA / "history.json"   # 传输历史：按电脑分组展示，长期保留
+HISTORY_LIMIT = 800                    # 最多保留的记录条数
 
 DEFAULT_CONFIG = {
     "port": 8080,
@@ -232,26 +233,99 @@ REPO.mkdir(parents=True, exist_ok=True)
 save_json(CONFIG_PATH, CFG)
 
 LOCK = threading.RLock()
-AGENTS = {}   # id -> {name, ip, last, saveDir, free}
-TASKS = {}    # tid -> task
+AGENTS = {}       # id -> {name, ip, last, saveDir, free}
+TASKS = {}        # tid -> task —— 仅本次运行有效，不落盘（重启主控即清空）
 TASK_ORDER = []
+HISTORY = []      # 传输历史记录，落盘到 history.json，长期保留
+HISTORY_INDEX = {}  # (tid, aid, file) -> 记录，避免心跳重复上报产生重复条目
 
 
-def load_tasks():
-    data = load_json(TASKS_PATH, [])
+def hist_key(r):
+    return (str(r.get("tid") or ""), str(r.get("aid") or ""), str(r.get("file") or ""))
+
+
+def time_text(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts or time.time()))
+
+
+def load_history():
+    data = load_json(HISTORY_PATH, [])
     if not isinstance(data, list):
         return
     with LOCK:
-        for t in data:
-            if isinstance(t, dict) and t.get("id"):
-                TASKS[t["id"]] = t
-                TASK_ORDER.append(t["id"])
+        for r in data:
+            if not isinstance(r, dict) or not r.get("aid") or not r.get("file"):
+                continue
+            key = hist_key(r)
+            if key in HISTORY_INDEX:
+                continue
+            r.setdefault("tid", "")
+            r.setdefault("name", r.get("aid"))
+            r.setdefault("status", "done")
+            r.setdefault("size", 0)
+            r["time"] = r.get("time") or 0
+            r["timeText"] = r.get("timeText") or time_text(r["time"])
+            HISTORY.append(r)
+            HISTORY_INDEX[key] = r
+        trim_history()
 
 
-def persist_tasks():
+def trim_history():
+    if len(HISTORY) > HISTORY_LIMIT:
+        dropped = HISTORY[:-HISTORY_LIMIT]
+        HISTORY[:] = HISTORY[-HISTORY_LIMIT:]
+        for r in dropped:
+            HISTORY_INDEX.pop(hist_key(r), None)
+
+
+def save_history():
     with LOCK:
-        items = [TASKS[tid] for tid in TASK_ORDER if tid in TASKS]
-    save_json(TASKS_PATH, items[-60:])
+        items = list(HISTORY[-HISTORY_LIMIT:])
+    save_json(HISTORY_PATH, items)
+
+
+def record_history(tid, aid, name, file, status, size):
+    """被控端每报出一个文件的最终状态时记一条；同一文件状态没变化则不重复写。"""
+    key = (str(tid), str(aid), str(file))
+    ts = time.time()
+    with LOCK:
+        r = HISTORY_INDEX.get(key)
+        if r and r.get("status") == status:
+            return False
+        if r:
+            r.update({
+                "status": status, "time": ts, "timeText": time_text(ts),
+                "name": name or r.get("name") or aid, "size": size or r.get("size") or 0,
+            })
+        else:
+            r = {
+                "tid": str(tid), "aid": str(aid), "name": name or str(aid),
+                "file": str(file), "status": status, "size": int(size or 0),
+                "time": ts, "timeText": time_text(ts),
+            }
+            HISTORY.append(r)
+            HISTORY_INDEX[key] = r
+            trim_history()
+    save_history()
+    return True
+
+
+def clear_task_progress():
+    """只清内存里的本次进度，文件传输不受影响。"""
+    with LOCK:
+        n = len(TASK_ORDER)
+        TASKS.clear()
+        TASK_ORDER.clear()
+    return n
+
+
+def clear_history_records():
+    with LOCK:
+        n = len(HISTORY)
+        HISTORY.clear()
+        HISTORY_INDEX.clear()
+    save_history()
+    return n
 
 
 _DIR_CACHE = {}   # name -> (computed_at, size, count)
@@ -399,8 +473,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in ("/", "/index.html"):
                 return self._send(200, html_page(), "text/html; charset=utf-8")
-            if path == "/favicon.ico":
-                return self._send(200, b"", "image/x-icon")
+            if path in ("/logo.png", "/favicon.ico"):
+                try:
+                    root = Path(getattr(sys, "_MEIPASS", BASE)) / "web"
+                    p = root / "logo.png"
+                    if not p.is_file():
+                        p = BASE / "web" / "logo.png"
+                    data = p.read_bytes()
+                    ctype = "image/png" if path == "/logo.png" else "image/x-icon"
+                    return self._send(200, data, ctype)
+                except Exception:
+                    return self._send(200, b"", "image/x-icon")
             if path == "/api/state":
                 return self._json(state_payload())
             if path == "/api/download":
@@ -422,6 +505,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/refresh":
                 _DIR_CACHE.clear()
                 return self._json({"repo": repo_list()})
+            if path == "/api/clear_progress":
+                n = clear_task_progress()
+                return self._json({"ok": True, "removed": n})
+            if path == "/api/clear_history":
+                n = clear_history_records()
+                return self._json({"ok": True, "removed": n})
             if path == "/api/open_repo":
                 try:
                     subprocess.Popen(["explorer", str(REPO)])
@@ -502,6 +591,7 @@ class Handler(BaseHTTPRequestHandler):
                 st["msg"] = str(d["msg"])[:300]
             st["updated"] = time.time()
             acc = 0
+            agent_name = (AGENTS.get(aid) or {}).get("name") or st.get("name") or aid
             for f in d.get("files") or []:
                 nm = str(f.get("name"))
                 fs = st["files"].setdefault(nm, {})
@@ -510,10 +600,10 @@ class Handler(BaseHTTPRequestHandler):
                 fs["size"] = int(f.get("size") or 0)
                 fs["st"] = str(f.get("st") or "pending")
                 acc += fs["done"]
+                if fs["st"] in ("done", "error"):
+                    record_history(tid, aid, agent_name, nm, fs["st"], fs["size"])
             st["done"] = acc
             task_recalc(t)
-            if st.get("status") in ("done", "error"):
-                persist_tasks()
         self._json({"ok": True, "cancel": bool(TASKS.get(tid, {}).get("cancel"))})
 
     def distribute(self):
@@ -563,7 +653,6 @@ class Handler(BaseHTTPRequestHandler):
             }
             TASKS[tid] = task
             TASK_ORDER.append(tid)
-            persist_tasks()
         self._json({"ok": True, "tid": tid})
 
     def cancel(self):
@@ -578,7 +667,6 @@ class Handler(BaseHTTPRequestHandler):
                     if st.get("status") in ("pending", "running"):
                         st["status"] = "error"
                         st["msg"] = "已被主控端取消"
-                persist_tasks()
         self._json({"ok": True})
 
     def upload(self):
@@ -683,14 +771,14 @@ def state_payload() -> dict:
                 }
             )
         agents.sort(key=lambda x: (not x["online"], (x["name"] or "").lower()))
-        tasks = []
+        tasks = []      # 本次运行的进度（重启即清空）
         for tid in reversed(TASK_ORDER):
             t = TASKS.get(tid)
-            if not t:
-                continue
-            tasks.append(t)
-            if len(tasks) >= 15:
+            if t:
+                tasks.append(t)
+            if len(tasks) >= 30:
                 break
+        history = sorted(HISTORY, key=lambda r: r.get("time") or 0, reverse=True)
     ip = lan_ip()
     return {
         "app": APP_NAME,
@@ -705,6 +793,7 @@ def state_payload() -> dict:
         "agents": agents,
         "repo": repo_list(),
         "tasks": tasks,
+        "history": history,
         "defaultDir": str(CFG.get("defaultDir") or ""),
     }
 
@@ -723,7 +812,7 @@ def html_page() -> str:
 
 def main():
     global ACTIVE_PORT
-    load_tasks()
+    load_history()
     port = int(CFG.get("port") or 8080)
     for attempt in range(12):
         try:
@@ -762,6 +851,11 @@ def main():
             pass
         os._exit(0)
 
+    def res_path(rel):
+        """兼容源码运行与 PyInstaller 打包后的资源路径"""
+        cand = Path(getattr(sys, "_MEIPASS", BASE)) / rel
+        return str(cand if cand.is_file() else BASE / rel)
+
     items = [
         (1001, "打开控制台", open_console),
         (1002, "打开文件仓库", open_repo),
@@ -775,6 +869,7 @@ def main():
         run_tray(
             "LANPush 主控端", items,
             on_double_click=open_console, icon_id=IDI_INFORMATION,
+            icon_path=res_path("icons/host.ico"),
             tip="已启动：http://%s:%d" % (lan_ip(), port),
         )
         do_exit()
