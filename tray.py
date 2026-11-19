@@ -44,6 +44,8 @@ if IS_WINDOWS:
     IDI_INFORMATION = 32516
     IDI_WARNING = 32515
     HWND_MESSAGE = -3
+    IMAGE_ICON = 1
+    LR_LOADFROMFILE = 0x0010
 
     class WNDCLASSW(ctypes.Structure):
         _fields_ = [
@@ -107,6 +109,12 @@ if IS_WINDOWS:
     _user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
     _user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
     _user32.LoadIconW.restype = wintypes.HICON
+    _user32.LoadImageW.argtypes = [
+        wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    _user32.LoadImageW.restype = wintypes.HICON
+    _user32.DestroyIcon.argtypes = [wintypes.HICON]
     _user32.CreatePopupMenu.argtypes = []
     _user32.CreatePopupMenu.restype = wintypes.HMENU
     _user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, wintypes.UINT_PTR, wintypes.LPCWSTR]
@@ -136,14 +144,15 @@ def _loword(v):
     return int(v) & 0xFFFF
 
 
-def run_tray(title, items, on_double_click=None, icon_id=None, tip=None):
+def run_tray(title, items, on_double_click=None, icon_id=None, tip=None, icon_path=None):
     """
     阻塞运行托盘消息循环。
 
     title: 托盘图标悬浮提示
     items: [(命令ID, 菜单文字, 回调函数), ...]，命令ID 从 1001 开始且唯一
     on_double_click: 双击托盘图标的回调
-    icon_id: 系统图标 ID（IDI_INFORMATION / IDI_APPLICATION / IDI_WARNING）
+    icon_id: 系统图标 ID（IDI_INFORMATION / IDI_APPLICATION / IDI_WARNING），作为兜底
+    icon_path: 自定义 .ico 文件路径（优先使用）
     tip: 气泡通知文字（可选）
     """
     if not IS_WINDOWS:
@@ -225,13 +234,27 @@ def run_tray(title, items, on_double_click=None, icon_id=None, tip=None):
     state["hwnd"] = hwnd
     state["proc"] = wnd_proc  # 防止被 GC
 
+    # 优先加载自定义 ico，失败则回退到系统图标
+    custom_icon = None
+    if icon_path:
+        try:
+            custom_icon = _user32.LoadImageW(
+                None, str(icon_path), IMAGE_ICON, 0, 0, LR_LOADFROMFILE
+            )
+        except Exception:
+            custom_icon = None
+    if custom_icon:
+        hicon = custom_icon
+    else:
+        hicon = _user32.LoadIconW(None, ctypes.cast(icon_id, wintypes.LPCWSTR))
+
     nid = NOTIFYICONDATAW()
     nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
     nid.hwnd = hwnd
     nid.uID = 1
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
     nid.uCallbackMessage = WM_TRAYICON
-    nid.hIcon = _user32.LoadIconW(None, ctypes.cast(icon_id, wintypes.LPCWSTR))
+    nid.hIcon = hicon
     nid.szTip = (title or "LANPush")[:127]
 
     if not _shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
