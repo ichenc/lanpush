@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LANPush 局域网文件分发</title>
+<link rel="icon" type="image/x-icon" href="/logo.png">
+<link rel="apple-touch-icon" href="/logo.png">
 <style>
   * { box-sizing: border-box; }
   :root {
@@ -35,8 +37,8 @@
   }
   .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; font-size: 15px; letter-spacing: .2px; white-space: nowrap; flex: 0 0 auto; }
   .logo {
-    width: 26px; height: 26px; border-radius: 7px; background: var(--accent); color: #fff;
-    display: grid; place-items: center; font-size: 13px; font-weight: 700; flex: 0 0 auto;
+    width: 28px; height: 28px; border-radius: 7px; flex: 0 0 auto;
+    display: block;
   }
   .addr {
     display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%;
@@ -166,6 +168,37 @@
   .up { font-size: 12px; color: var(--muted); padding: 6px 0 0; }
   .spin { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: pulse 1s infinite; }
   @keyframes pulse { 0%,100% { opacity: .25 } 50% { opacity: 1 } }
+
+  /* ---------- 分发历史（按电脑分组） ---------- */
+  .history-intro { padding: 9px 14px 0; color: var(--muted); font-size: 12px; }
+  .hgroup { margin: 10px 12px; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .hgroup:last-child { margin-bottom: 12px; }
+  .hg-head {
+    display: flex; align-items: center; gap: 7px; padding: 8px 11px;
+    background: #f1f4f8; border-bottom: 1px solid var(--line);
+    font-size: 13px; font-weight: 620;
+  }
+  .hg-head .pcmodel { width: 17px; height: 17px; flex: 0 0 auto; }
+  .hg-head .hname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hg-head .tag.on { background: #e8f7ef; color: var(--ok); }
+  .hg-head .toggle { margin-left: auto; }
+  .hg-body { background: #fff; }
+  .hg-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12.5px; }
+  .hg-table .tcol { width: 152px; }
+  .hg-table .rcol { width: 72px; }
+  .hg-table th {
+    text-align: left; font-weight: 500; color: var(--muted);
+    padding: 7px 11px; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  .hg-table td { padding: 7px 11px; border-bottom: 1px solid #f1f3f6; }
+  .hg-table tr:last-child td { border-bottom: 0; }
+  .hg-file { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hg-time { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .hg-result { white-space: nowrap; }
+  .hg-ok { color: var(--ok); }
+  .hg-bad { color: var(--bad); }
+  .hcollapsed .hg-body { display: none; }
+
   .footer { text-align: center; color: #98a2b3; font-size: 11.5px; padding: 4px 0 0; }
 
   @media (max-width: 760px) {
@@ -173,6 +206,7 @@
     .row .rs { width: 96px; flex: 0 0 96px; }
     .task-h .paths { max-width: 100%; flex: 1 1 100%; }
     .dev .meta { display: none; }
+    .hg-table .tcol { width: 124px; }
     main { padding: 12px 12px 24px; }
     header { padding: 10px 12px; }
   }
@@ -180,7 +214,7 @@
 </head>
 <body>
 <header>
-  <div class="brand"><span class="logo">LP</span>局域网文件分发</div>
+  <div class="brand"><img class="logo" src="/logo.png" alt="LANPush">局域网文件分发</div>
   <div class="addr" title="被控端填这个地址（一般在同一局域网内会自动发现，无需填写）">
     服务地址 <b id="url">-</b>
     <button class="ghost" onclick="copyUrl()">复制</button>
@@ -253,8 +287,15 @@
 
     <!-- 进度 -->
     <section class="card">
-      <div class="card-h">4. 分发进度<span class="hint">每个设备独立进度，断点自动续传</span></div>
+      <div class="card-h">4. 分发进度<span class="hint">仅本次打开期间，关闭主控后自动清空</span></div>
       <div id="tasks"></div>
+    </section>
+
+    <!-- 历史 -->
+    <section class="card">
+      <div class="card-h">5. 分发历史<span class="hint">按电脑分组，长期保存</span></div>
+      <div class="history-intro">所有分发都会按电脑记录，方便随时查看。</div>
+      <div id="historyBox"></div>
     </section>
     <div class="footer" id="footer"></div>
   </div>
@@ -265,7 +306,9 @@ var state = { agents: [], repo: [], tasks: [], host: {} };
 var selDev = new Set();     // 选中的设备 id
 var selFile = new Set();    // 选中的文件名
 var knownDev = new Set();
-var lastTaskSig = "";
+var taskSigCache = { tasks: "" };
+var histSig = "";
+var collapsedGroups = new Set();
 var busy = false;
 
 function el(id) { return document.getElementById(id); }
@@ -296,6 +339,7 @@ function poll() {
       renderDevices();
       renderFiles();
       renderTasks();
+      renderHistory();
       if (!el("dir").dataset.touched && s.defaultDir) el("dir").value = s.defaultDir;
     })
     .catch(function () {
@@ -483,20 +527,22 @@ function distribute() {
 function statusText(st) {
   return { pending: "等待对方连接", running: "传输中", done: "已完成", error: "失败" }[st] || st || "等待中";
 }
-function renderTasks() {
-  var box = el("tasks");
-  var sig = state.tasks.map(function (t) {
+function renderTaskList(list, boxId, sigKey, emptyText) {
+  var box = el(boxId);
+  var sig = list.map(function (t) {
     return t.id + ":" + Object.keys(t.agents || {}).join(",") + ":" + t.status;
   }).join("|");
-  if (!state.tasks.length) {
-    box.innerHTML = '<div class="empty" style="padding:22px 0">还没有分发任务</div>';
-    lastTaskSig = "";
+  if (!list.length) {
+    if (taskSigCache[sigKey] !== "empty") {
+      taskSigCache[sigKey] = "empty";
+      box.innerHTML = '<div class="empty" style="padding:22px 0">' + esc(emptyText) + '</div>';
+    }
     return;
   }
-  if (sig !== lastTaskSig) {
-    lastTaskSig = sig;
+  if (sig !== taskSigCache[sigKey]) {
+    taskSigCache[sigKey] = sig;
     var html = "";
-    state.tasks.forEach(function (t) {
+    list.forEach(function (t) {
       var labels = t.labels || (t.files || []).map(function (f) { return f.rel || f.name; });
       var fnames = labels.length > 3
         ? labels.slice(0, 2).join("、") + " 等 " + labels.length + " 项"
@@ -520,7 +566,7 @@ function renderTasks() {
     box.innerHTML = html;
   }
   // 增量更新
-  state.tasks.forEach(function (t) {
+  list.forEach(function (t) {
     var node = box.querySelector('[data-tid="' + t.id.replace(/"/g, '\\"') + '"]');
     if (!node) return;
     Object.keys(t.agents || {}).forEach(function (aid) {
@@ -541,6 +587,91 @@ function renderTasks() {
       pill.className = "pill " + t.status;
       pill.textContent = { running: "传输中", done: "全部完成", partial: "部分失败", failed: "失败", cancelled: "已取消" }[t.status] || t.status;
     }
+  });
+}
+function renderTasks() {
+  renderTaskList(state.tasks || [], "tasks", "tasks", "本次没有进行中的分发任务");
+}
+
+/* ---------------- 分发历史：按电脑名分组 ---------------- */
+var PC_ICON = '<svg class="pcmodel" viewBox="0 0 18 18" aria-hidden="true">' +
+  '<rect x="1.8" y="2.8" width="14.4" height="10" rx="1.7" fill="#eaf1fe" stroke="#1d6ff2" stroke-width="1.2"/>' +
+  '<path d="M6 16h6M9 12.8V16" stroke="#1d6ff2" stroke-width="1.2" stroke-linecap="round"/></svg>';
+
+function renderHistory() {
+  var box = el("historyBox");
+  var list = state.history || [];
+  var sig = list.map(function (r) {
+    return [r.aid, r.name, r.file, r.status, r.time].join("~");
+  }).join("|") + "#" + state.agents.map(function (a) {
+    return a.id + ":" + a.online + ":" + a.name;
+  }).join("|") + "#" + Array.from(collapsedGroups).sort().join(",");
+  if (sig === histSig) return;
+  histSig = sig;
+
+  if (!list.length) {
+    box.innerHTML = '<div class="empty" style="padding:22px 0">还没有传输记录</div>';
+    return;
+  }
+
+  var live = {};
+  state.agents.forEach(function (a) { live[a.id] = a; });
+  var groups = {};
+  list.forEach(function (r) {
+    var aid = r.aid || "-";
+    var a = live[aid];
+    if (!groups[aid]) {
+      groups[aid] = {
+        aid: aid,
+        name: (a && a.name) || r.name || aid,
+        online: a ? a.online : false,
+        items: []
+      };
+    }
+    if (a && a.name) groups[aid].name = a.name;
+    if (a) groups[aid].online = a.online;
+    groups[aid].items.push(r);
+  });
+
+  var arr = Object.keys(groups).map(function (k) { return groups[k]; });
+  arr.sort(function (x, y) {
+    return String(x.name).localeCompare(String(y.name), "zh-CN", { numeric: true });
+  });
+
+  var html = "";
+  arr.forEach(function (g) {
+    g.items.sort(function (x, y) { return (y.time || 0) - (x.time || 0); });
+    var collapsed = collapsedGroups.has(g.aid);
+    html += '<div class="hgroup' + (collapsed ? " hcollapsed" : "") + '" data-aid="' + esc(g.aid) + '">' +
+      '<div class="hg-head">' + PC_ICON +
+      '<span class="hname" title="' + esc(g.name) + '">' + esc(g.name) + '</span>' +
+      '<span class="tag' + (g.online ? " on" : "") + '">' + (g.online ? "在线" : "离线") + '</span>' +
+      '<button class="ghost toggle">' + (collapsed ? "详细日志" : "收起日志") + '</button>' +
+      '</div><div class="hg-body">' +
+      '<table class="hg-table"><colgroup><col><col class="tcol"><col class="rcol"></colgroup>' +
+      '<thead><tr><th>文件</th><th>最近分发</th><th>结果</th></tr></thead><tbody>';
+    g.items.forEach(function (r) {
+      var ok = r.status === "done";
+      html += '<tr>' +
+        '<td class="hg-file" title="' + esc(r.file) + '">' + esc(r.file) + '</td>' +
+        '<td class="hg-time" title="' + esc(r.timeText || "") + '">' + esc(r.timeText || "-") + '</td>' +
+        '<td class="hg-result ' + (ok ? "hg-ok" : "hg-bad") + '">' + (ok ? "成功" : "失败") + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table></div></div>';
+  });
+  box.innerHTML = html;
+
+  Array.prototype.forEach.call(box.querySelectorAll(".hgroup"), function (node) {
+    var btn = node.querySelector(".toggle");
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+      var aid = node.getAttribute("data-aid");
+      if (collapsedGroups.has(aid)) collapsedGroups.delete(aid);
+      else collapsedGroups.add(aid);
+      histSig = "";
+      renderHistory();
+    });
   });
 }
 
