@@ -23,7 +23,7 @@ from pathlib import Path
 
 from tray import tray_available, run_tray, IDI_APPLICATION, IDI_WARNING
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 APP_NAME = "LANPush 被控端"
 DISCOVERY_PORT = 8099        # 主控 -> 被控，广播
 DISCOVERY_REPLY_PORT = 8098  # 被控 -> 主控，主动询问
@@ -102,6 +102,14 @@ def default_id() -> str:
     return raw
 
 
+def current_hostname() -> str:
+    """读取系统当前计算机名（改用机器名后以此为准）"""
+    try:
+        return (socket.gethostname() or "").strip()
+    except Exception:
+        return ""
+
+
 def load_config() -> dict:
     cfg = {"server": "", "saveDir": "", "id": "", "name": ""}
     try:
@@ -111,8 +119,13 @@ def load_config() -> dict:
         pass
     if not cfg.get("id"):
         cfg["id"] = default_id()
+    # 关键修复：机器名每次启动都以系统当前值为准，
+    # 否则改完电脑名后配置文件里仍是旧的 DESKTOP-xxx。
+    osname = current_hostname()
+    if osname and not cfg.get("nameLocked"):
+        cfg["name"] = osname
     if not cfg.get("name"):
-        cfg["name"] = socket.gethostname()
+        cfg["name"] = osname or "PC"
     if not cfg.get("saveDir"):
         cfg["saveDir"] = default_save_dir()
     save_config(cfg)
@@ -127,17 +140,30 @@ def save_config(cfg: dict):
         pass
 
 
+_MUTEX_HANDLE = None  # 持有句柄，避免被 GC 释放导致互斥失效
+
+
 def single_instance() -> bool:
-    """命名互斥体，防止重复运行"""
+    """命名互斥体，防止重复运行。必须在创建托盘之前调用。"""
+    global _MUTEX_HANDLE
     try:
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.CreateMutexW(None, False, "Global\\LANPushAgentMutex")
-        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-            return False
-        _ = handle
-        return True
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        # Global 需特权，普通用户改到 Local；两种都试，命中已存在即判定重复
+        for name in ("Global\\LANPushAgentMutex", "Local\\LANPushAgentMutex"):
+            ctypes.set_last_error(0)
+            h = kernel32.CreateMutexW(None, False, name)
+            err = ctypes.get_last_error()
+            if not h:
+                continue  # 创建失败（如无 Global 权限），试下一个
+            if err == 183:  # ERROR_ALREADY_EXISTS
+                return False
+            _MUTEX_HANDLE = h
+            return True
+        return True  # 都建不了就放行，避免误杀
     except Exception:
         return True
 
@@ -496,10 +522,6 @@ def run_task(base, aid, task, cfg) -> None:
 
 # ---------------------------------------------------------------- 主循环
 def main():
-    if not single_instance():
-        log("已经有一个被控端在运行，本次退出")
-        return
-
     cfg = load_config()
     args = sys.argv[1:]
     for i, a in enumerate(args):
@@ -534,6 +556,12 @@ def main():
                 continue
 
         try:
+            # 每次心跳都校准一次机器名：运行中改名也能立刻反映到主控端
+            osname = current_hostname()
+            if osname and not cfg.get("nameLocked") and cfg.get("name") != osname:
+                cfg["name"] = osname
+                STATUS["device"] = osname
+                save_config(cfg)
             free = 0
             try:
                 import shutil
@@ -623,9 +651,12 @@ def _tray_main():
         (1004, None, None),
         (1005, "退出被控端", do_exit),
     ]
+    cand = Path(getattr(sys, "_MEIPASS", BASE)) / "icons" / "agent.ico"
+    icon_path = str(cand if cand.is_file() else BASE / "icons" / "agent.ico")
     run_tray(
         "LANPush 被控端", items,
         on_double_click=show_log, icon_id=IDI_APPLICATION,
+        icon_path=icon_path,
     )
 
 
@@ -639,6 +670,13 @@ def msgbox(text, title="LANPush"):
 
 
 if __name__ == "__main__":
+    # 必须在创建托盘之前检查：否则重复实例的托盘线程已起来，return 无法结束进程
+    if not single_instance():
+        try:
+            log("已经有一个被控端在运行，本次退出（未创建第二个托盘）")
+        except Exception:
+            pass
+        os._exit(0)
     if tray_available():
         threading.Thread(target=_tray_main, daemon=False).start()
     while STATUS["running"]:
