@@ -228,6 +228,10 @@ def human(n) -> str:
 # ---------------------------------------------------------------- 状态
 CFG = dict(DEFAULT_CONFIG)
 CFG.update(load_json(CONFIG_PATH, {}))
+# 文件仓库固定在程序所在目录（exe 旁）的"待分发"。
+# 旧版本把绝对路径缓存进配置，程序移动/重新解压后会指向旧的"待分发"，
+# 导致文件放到了新位置却读不到。这里始终以当前 exe 目录为准并写回纠正。
+CFG["repo"] = str(BASE / "待分发")
 REPO = Path(CFG["repo"])
 REPO.mkdir(parents=True, exist_ok=True)
 save_json(CONFIG_PATH, CFG)
